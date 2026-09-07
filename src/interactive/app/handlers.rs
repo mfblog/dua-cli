@@ -49,7 +49,7 @@ enum AnnotationKind {
 /// [`EntryDeletionStats`] describes the lower-level removal of one selected entry.
 struct DeletionStats {
     entries: usize,
-    bytes: u128,
+    bytes: Option<u128>,
     errors: usize,
     elapsed: Duration,
 }
@@ -58,6 +58,7 @@ struct DeletionStats {
 #[derive(Default)]
 struct EntryDeletionStats {
     entries: usize,
+    /// Scanned size, assigned only after the selected entry was completely removed.
     bytes: u128,
     errors: usize,
 }
@@ -379,7 +380,7 @@ impl AppState {
                         self.language.ui_text().notification_deletion,
                         DeletionStats {
                             entries: entries_deleted,
-                            bytes: bytes_deleted,
+                            bytes: (errors == 0).then_some(bytes_deleted),
                             elapsed: start.elapsed(),
                             errors,
                         },
@@ -422,7 +423,7 @@ impl AppState {
                         self.language.ui_text().notification_trash,
                         DeletionStats {
                             entries: entries_trashed,
-                            bytes: bytes_trashed,
+                            bytes: Some(bytes_trashed),
                             elapsed: start.elapsed(),
                             errors,
                         },
@@ -706,28 +707,26 @@ fn io_err_to_usize(err: io::Error) -> usize {
 /// sees an empty directory.
 fn delete_directory_recursively(path: PathBuf, threads: usize) -> EntryDeletionStats {
     let mut stats = EntryDeletionStats::default();
-    let mut dirs: Vec<(PathBuf, u128, usize)> = Vec::new();
-    let mut files: Vec<(PathBuf, u128)> = Vec::new();
+    let mut dirs: Vec<(PathBuf, usize)> = Vec::new();
+    let mut files: Vec<PathBuf> = Vec::new();
 
     for entry in dua_core::walk(
         &path,
         threads,
         dua_core::Order::Completion,
-        dua_core::Options::default(),
+        dua_core::Options::default().skip_metadata(),
         |_| true,
     ) {
         match entry {
             Ok(entry) => {
                 let entry_path = entry.path();
-                let bytes =
-                    u128::from(entry.metadata.as_ref().map_or(0, |metadata| metadata.len()));
                 if entry.file_type.is_dir() {
                     // Real directory (symlinks to dirs report is_symlink, not
                     // is_dir, when follow_links is false): remove after children.
-                    dirs.push((entry_path, bytes, entry.depth));
+                    dirs.push((entry_path, entry.depth));
                 } else {
                     // Regular file or symlink — remove without following.
-                    files.push((entry_path, bytes));
+                    files.push(entry_path);
                 }
             }
             Err(_) => stats.errors += 1,
@@ -740,10 +739,12 @@ fn delete_directory_recursively(path: PathBuf, threads: usize) -> EntryDeletionS
             .map(|_| {
                 scope.spawn(|| {
                     let mut total = EntryDeletionStats::default();
-                    while let Some((path, bytes)) =
-                        files.get(next_file.fetch_add(1, Ordering::Relaxed))
-                    {
-                        record_removal(fs::remove_file(path), *bytes, &mut total);
+                    while let Some(path) = files.get(next_file.fetch_add(1, Ordering::Relaxed)) {
+                        let result = fs::remove_file(path);
+                        // Windows directory symlinks and junctions require RemoveDirectory.
+                        #[cfg(windows)]
+                        let result = result.or_else(|_| fs::remove_dir(path));
+                        record_removal(result, &mut total);
                     }
                     total
                 })
@@ -755,21 +756,18 @@ fn delete_directory_recursively(path: PathBuf, threads: usize) -> EntryDeletionS
             .map(|handle| handle.join().expect("deletion worker does not panic"))
             .fold(EntryDeletionStats::default(), |mut total, stats| {
                 total.entries += stats.entries;
-                total.bytes += stats.bytes;
                 total.errors += stats.errors;
                 total
             })
     });
     stats.entries += file_stats.entries;
-    stats.bytes += file_stats.bytes;
     stats.errors += file_stats.errors;
 
     // Remove directories deepest-first so parents are empty when removed.
-    dirs.sort_by(|a, b| a.2.cmp(&b.2).reverse());
-    for (dir, bytes, _) in dirs {
+    dirs.sort_by(|(_, a_depth), (_, b_depth)| a_depth.cmp(b_depth).reverse());
+    for (dir, _) in dirs {
         record_removal(
             fs::remove_dir(&dir).or_else(|_| fs::remove_file(dir)),
-            bytes,
             &mut stats,
         );
     }
@@ -777,12 +775,9 @@ fn delete_directory_recursively(path: PathBuf, threads: usize) -> EntryDeletionS
     stats
 }
 
-fn record_removal(result: io::Result<()>, bytes: u128, stats: &mut EntryDeletionStats) {
+fn record_removal(result: io::Result<()>, stats: &mut EntryDeletionStats) {
     match result {
-        Ok(()) => {
-            stats.entries += 1;
-            stats.bytes += bytes;
-        }
+        Ok(()) => stats.entries += 1,
         Err(err) => stats.errors += io_err_to_usize(err),
     }
 }
@@ -794,15 +789,13 @@ mod deletion_notification_tests {
     #[test]
     fn retains_partial_success_statistics_alongside_errors() {
         let mut stats = EntryDeletionStats::default();
-        record_removal(Ok(()), 42, &mut stats);
+        record_removal(Ok(()), &mut stats);
         record_removal(
             Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
-            100,
             &mut stats,
         );
 
         assert_eq!(stats.entries, 1);
-        assert_eq!(stats.bytes, 42);
         assert_eq!(stats.errors, 1);
     }
 }
@@ -841,25 +834,38 @@ mod delete_directory_recursively_tests {
         assert!(!root.exists());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn removes_symlink_without_following_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("target");
-        fs::create_dir(&target).unwrap();
-        fs::write(target.join("keep.txt"), b"keep").unwrap();
+        for delete_parent in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("target");
+            fs::create_dir(&target).unwrap();
+            fs::write(target.join("keep.txt"), b"keep").unwrap();
 
-        let link = dir.path().join("link");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
+            let root = dir.path().join("root");
+            fs::create_dir(&root).unwrap();
+            let link = root.join("link");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            #[cfg(windows)]
+            match std::os::windows::fs::symlink_dir(&target, &link) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::PermissionDenied => return,
+                Err(err) => panic!("directory symlink can be created: {err}"),
+            }
 
-        let stats = delete_directory_recursively(link.clone(), 1);
+            let stats =
+                delete_directory_recursively(if delete_parent { root } else { link.clone() }, 2);
 
-        assert_eq!(stats.errors, 0);
-        assert!(!link.exists(), "the symlink itself should be gone");
-        assert!(
-            target.join("keep.txt").exists(),
-            "the symlink target must not be deleted"
-        );
+            assert_eq!(stats.errors, 0);
+            assert_eq!(stats.entries, if delete_parent { 2 } else { 1 });
+            assert!(!link.exists(), "the symlink itself should be gone");
+            assert!(
+                target.join("keep.txt").exists(),
+                "the symlink target must not be deleted"
+            );
+        }
     }
 
     #[test]

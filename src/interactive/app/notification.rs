@@ -25,7 +25,7 @@ pub fn deletion_finished(
     language: Language,
     action: &str,
     entries: usize,
-    bytes: u128,
+    bytes: Option<u128>,
     elapsed: Duration,
     errors: usize,
     format: ByteFormat,
@@ -33,7 +33,7 @@ pub fn deletion_finished(
     language.notification_summary(
         action,
         u64::try_from(entries).unwrap_or(u64::MAX),
-        &format.display(bytes).to_string(),
+        &bytes.map_or_else(|| "?".into(), |bytes| format.display(bytes).to_string()),
         &duration(elapsed),
         u64::try_from(errors).unwrap_or(u64::MAX),
     )
@@ -77,6 +77,22 @@ fn duration(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_deletion_reports_unknown_bytes() {
+        assert_eq!(
+            deletion_finished(
+                Language::English,
+                "Deletion",
+                2,
+                None,
+                Duration::from_secs(1),
+                1,
+                ByteFormat::Metric
+            ),
+            "Deletion finished: 2 entries, ? in 1.0s, 1 errors"
+        );
+    }
 
     #[test]
     fn emits_sanitized_osc_777_notification() {
