@@ -3,16 +3,17 @@ use crate::interactive::app::tests::utils::{
     new_test_terminal,
 };
 use crate::interactive::terminal::TerminalApp;
+use crate::interactive::widgets::Language;
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use dua::{ByteFormat, Config, TraversalSorting, WalkOptions};
+use dua::{ByteFormat, Config, WalkOptions};
 use pretty_assertions::assert_eq;
 use std::{collections::BTreeSet, fs};
 use tempfile::TempDir;
 
 fn marked_file_names(app: &TerminalApp, message: &str) -> BTreeSet<String> {
     app.window
-        .mark_pane
+        .mark
         .as_ref()
         .expect(message)
         .marked()
@@ -41,7 +42,7 @@ fn basic_user_journey_with_deletion() -> Result<()> {
     app.process_events(&mut terminal, into_codes("doddd"))?;
 
     assert_eq!(
-        app.window.mark_pane.as_ref().map(|p| p.marked().len()),
+        app.window.mark.as_ref().map(|p| p.marked().len()),
         Some(4),
         "expecting 4 selected items, the parent dir, and some children"
     );
@@ -57,7 +58,7 @@ fn basic_user_journey_with_deletion() -> Result<()> {
         ]),
     )?;
     assert!(
-        app.window.mark_pane.is_none(),
+        app.window.mark.is_none(),
         "the marker pane is gone as all items have been removed"
     );
     assert_eq!(
@@ -120,9 +121,10 @@ $precious.tmp
         threads: 1,
         apparent_size: true,
         count_hard_links: false,
-        sorting: TraversalSorting::AlphabeticalByFileName,
         cross_filesystems: false,
-        ignore_dirs: Default::default(),
+        ignore_dirs: BTreeSet::default(),
+        ignore_patterns: None,
+        metadata_options: dua::TraversalOptions::default(),
     };
     let (_key_send, key_receive) = crossbeam::channel::bounded(0);
     let mut app = TerminalApp::initialize(
@@ -131,8 +133,12 @@ $precious.tmp
         ByteFormat::Metric,
         true,
         vec![root.to_owned()],
+        None,
         Config::default(),
+        dua::traverse::Traversal::new(),
+        None,
     )?;
+    app.state.language = Language::English;
     app.traverse()?;
     app.run_until_traversed(&mut terminal, key_receive)?;
 
@@ -172,8 +178,8 @@ $precious.tmp
     );
     assert_eq!(
         app.state.message.as_deref(),
-        Some("6 cleanup candidates (X|I)"),
-        "footer message advertises both cleanup and gitignore shortcuts"
+        Some("1 cleanup, 5 gitignored"),
+        "footer message describes both annotation types"
     );
     app.process_events(&mut terminal, into_codes("i"))?;
     assert!(
@@ -182,13 +188,13 @@ $precious.tmp
     );
     assert_eq!(
         app.state.message.as_deref(),
-        Some("1 cleanup candidate (X)"),
-        "footer message drops the gitignore shortcut when disabled"
+        Some("1 cleanup candidate"),
+        "footer message drops gitignore details when disabled"
     );
     app.process_events(&mut terminal, into_codes("i"))?;
     assert_eq!(
         app.state.message.as_deref(),
-        Some("6 cleanup candidates (X|I)"),
+        Some("1 cleanup, 5 gitignored"),
         "gitignored entry detection can be enabled again"
     );
 
@@ -257,9 +263,10 @@ fn cleanup_candidates_are_marked_with_one_key_after_entering_project_dir() -> Re
         threads: 1,
         apparent_size: true,
         count_hard_links: false,
-        sorting: TraversalSorting::AlphabeticalByFileName,
         cross_filesystems: false,
-        ignore_dirs: Default::default(),
+        ignore_dirs: BTreeSet::default(),
+        ignore_patterns: None,
+        metadata_options: dua::TraversalOptions::default(),
     };
     let (_key_send, key_receive) = crossbeam::channel::bounded(0);
     let mut app = TerminalApp::initialize(
@@ -268,8 +275,12 @@ fn cleanup_candidates_are_marked_with_one_key_after_entering_project_dir() -> Re
         ByteFormat::Metric,
         true,
         vec![root.to_owned()],
+        None,
         Config::default(),
+        dua::traverse::Traversal::new(),
+        None,
     )?;
+    app.state.language = Language::English;
     app.traverse()?;
     app.run_until_traversed(&mut terminal, key_receive)?;
 

@@ -2,23 +2,21 @@ use anyhow::{Context, Error, Result};
 use crossbeam::channel::Receiver;
 use crossterm::event::{Event, KeyCode};
 use dua::{
-    ByteFormat, Config, TraversalSorting, WalkOptions,
-    traverse::{EntryData, Tree, TreeIndex},
+    ByteFormat, Config, WalkOptions,
+    traverse::{Entry, EntryData, Tree, TreeIndex},
 };
 use itertools::Itertools;
-use jwalk::{DirEntry, WalkDir};
-use petgraph::prelude::NodeIndex;
 use std::{
+    collections::BTreeSet,
     env::temp_dir,
     ffi::OsStr,
-    fmt,
     fs::{copy, create_dir_all, remove_dir, remove_file},
     io::ErrorKind,
     path::{Path, PathBuf},
 };
 use tui::{Terminal, backend::TestBackend};
 
-use crate::interactive::{app::tests::FIXTURE_PATH, terminal::TerminalApp};
+use crate::interactive::{app::tests::FIXTURE_PATH, terminal::TerminalApp, widgets::Language};
 
 pub fn into_events<'a>(events: impl IntoIterator<Item = Event> + 'a) -> Receiver<Event> {
     let (key_send, key_receive) = crossbeam::channel::unbounded();
@@ -38,11 +36,11 @@ pub fn into_codes(input: &str) -> Receiver<Event> {
     into_keys(input.chars().map(KeyCode::Char))
 }
 
-pub fn node_by_index(app: &TerminalApp, id: TreeIndex) -> &EntryData {
-    app.traversal.tree.node_weight(id).unwrap()
+pub fn node_by_index(app: &TerminalApp, id: TreeIndex) -> Entry<'_> {
+    app.traversal.tree.entry(id).unwrap()
 }
 
-pub fn node_by_name(app: &TerminalApp, name: impl AsRef<OsStr>) -> &EntryData {
+pub fn node_by_name(app: &TerminalApp, name: impl AsRef<OsStr>) -> Entry<'_> {
     node_by_index(app, index_by_name(app, name))
 }
 
@@ -55,10 +53,10 @@ pub fn index_by_name_and_size(
     let t: Vec<_> = app
         .traversal
         .tree
-        .node_indices()
+        .indices()
         .map(|idx| (idx, node_by_index(app, idx)))
         .filter_map(|(idx, e)| {
-            if e.name == name && size.map(|s| s == e.size).unwrap_or(true) {
+            if e.name == name && size.is_none_or(|s| s == e.size) {
                 Some(idx)
             } else {
                 None
@@ -90,15 +88,19 @@ fn delete_recursive(path: impl AsRef<Path>) -> Result<()> {
     let mut files: Vec<_> = Vec::new();
     let mut dirs: Vec<_> = Vec::new();
 
-    for entry in WalkDir::new(&path)
-        .parallelism(jwalk::Parallelism::Serial)
-        .into_iter()
-    {
-        let entry: DirEntry<_> = entry?;
+    for entry in dua_core::walk(
+        path.as_ref(),
+        1,
+        dua_core::Order::Completion,
+        dua_core::Options::default(),
+        |_| true,
+    ) {
+        let entry = entry?;
         let p = entry.path();
-        match p.is_dir() {
-            true => dirs.push(p),
-            false => files.push(p),
+        if entry.file_type.is_dir() {
+            dirs.push(p);
+        } else {
+            files.push(p);
         }
     }
 
@@ -117,18 +119,21 @@ fn delete_recursive(path: impl AsRef<Path>) -> Result<()> {
 }
 
 fn copy_recursive(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<(), Error> {
-    for entry in WalkDir::new(&src)
-        .parallelism(jwalk::Parallelism::Serial)
-        .into_iter()
-    {
-        let entry: DirEntry<_> = entry?;
+    for entry in dua_core::walk(
+        src.as_ref(),
+        1,
+        dua_core::Order::ParentFirst,
+        dua_core::Options::default(),
+        |_| true,
+    ) {
+        let entry = entry?;
         let entry_path = entry.path();
         entry_path
             .strip_prefix(&src)
             .map_err(Error::from)
             .and_then(|relative_entry_path| {
                 let dst = dst.as_ref().join(relative_entry_path);
-                if entry_path.is_dir() {
+                if entry.file_type.is_dir() {
                     create_dir_all(dst).map_err(Into::into)
                 } else {
                     copy(&entry_path, dst)
@@ -196,26 +201,31 @@ pub fn untraversed_app_and_terminal_with_closure(
         threads: 1,
         apparent_size: true,
         count_hard_links: false,
-        sorting: TraversalSorting::AlphabeticalByFileName,
         cross_filesystems: false,
-        ignore_dirs: Default::default(),
+        ignore_dirs: BTreeSet::default(),
+        ignore_patterns: None,
+        metadata_options: dua::TraversalOptions::default(),
     };
 
     let input_paths = fixture_paths.iter().map(|c| convert(c.as_ref())).collect();
 
-    let app = TerminalApp::initialize(
+    let mut app = TerminalApp::initialize(
         &mut terminal,
         walk_options,
         ByteFormat::Metric,
         false, /* entry-check */
         input_paths,
+        None,
         Config::default(),
+        dua::traverse::Traversal::new(),
+        None,
     )?;
+    app.state.language = Language::English;
 
     Ok((terminal, app))
 }
 
-pub fn new_test_terminal() -> std::io::Result<Terminal<TestBackend>> {
+pub fn new_test_terminal() -> Result<Terminal<TestBackend>, std::convert::Infallible> {
     Terminal::new(TestBackend::new(40, 20))
 }
 
@@ -231,16 +241,12 @@ pub fn initialized_app_and_terminal_from_paths(
 pub fn initialized_app_and_terminal_from_fixture(
     fixture_paths: &[&str],
 ) -> Result<(Terminal<TestBackend>, TerminalApp), Error> {
-    #[allow(clippy::redundant_closure)]
-    // doesn't actually work that way due to borrowchk - probably a bug
     initialized_app_and_terminal_with_closure(fixture_paths, |p| fixture(p))
 }
 
 pub fn untraversed_app_and_terminal_from_fixture(
     fixture_paths: &[&str],
 ) -> Result<(Terminal<TestBackend>, TerminalApp), Error> {
-    #[allow(clippy::redundant_closure)]
-    // doesn't actually work that way due to borrowchk - probably a bug
     untraversed_app_and_terminal_with_closure(fixture_paths, |p| fixture(p))
 }
 
@@ -249,7 +255,7 @@ pub fn sample_01_tree() -> Tree {
     {
         let mut add_node = make_add_node(&mut tree);
         #[cfg(not(windows))]
-        let root_size = 1275454;
+        let root_size = 1_275_454;
         #[cfg(windows)]
         let root_size = 1259069;
         let rn = add_node("", root_size, 14, None);
@@ -265,7 +271,7 @@ pub fn sample_01_tree() -> Tree {
                 add_node("c.lnk", 0, 0, Some(sn));
 
                 #[cfg(not(windows))]
-                let dn = add_node("dir", 1270312, 8, Some(sn));
+                let dn = add_node("dir", 1_270_312, 8, Some(sn));
                 #[cfg(windows)]
                 let dn = add_node("dir", 1258024, 8, Some(sn));
                 {
@@ -352,21 +358,17 @@ pub fn sample_02_tree(use_native_separator: bool) -> (Tree, TreeIndex) {
 
 pub fn make_add_node(
     t: &mut Tree,
-) -> impl FnMut(&str, u128, u64, Option<NodeIndex>) -> NodeIndex + '_ {
+) -> impl FnMut(&str, u128, u64, Option<TreeIndex>) -> TreeIndex + '_ {
     move |name, size, entry_count, maybe_from_idx| {
-        let n = t.add_node(EntryData {
-            name: PathBuf::from(name),
+        let data = EntryData {
             size,
             entry_count: (entry_count > 0).then_some(entry_count),
             ..Default::default()
-        });
-        if let Some(from) = maybe_from_idx {
-            t.add_edge(from, n, ());
+        };
+        if let Some(parent) = maybe_from_idx {
+            t.add_child(parent, name, data)
+        } else {
+            t.add_root(name, data)
         }
-        n
     }
-}
-
-pub fn debug(item: impl fmt::Debug) -> String {
-    format!("{item:#?}")
 }

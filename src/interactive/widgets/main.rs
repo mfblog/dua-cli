@@ -6,9 +6,10 @@ use crate::interactive::{
         HelpPane, HelpPaneProps, MarkPane, MarkPaneProps,
     },
 };
-use Constraint::*;
-use FocussedPane::*;
+use Constraint::{Length, Max, Percentage};
+use FocussedPane::{Glob, Help, Main, Mark};
 use std::borrow::Borrow;
+use std::path::PathBuf;
 use tui::buffer::Buffer;
 use tui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -17,7 +18,7 @@ use tui::{
 };
 
 pub struct MainWindowProps<'a> {
-    pub current_path: String,
+    pub current_path: PathBuf,
     pub entries_traversed: u64,
     pub total_bytes: u128,
     pub start: std::time::Instant,
@@ -29,10 +30,10 @@ pub struct MainWindowProps<'a> {
 
 #[derive(Default)]
 pub struct MainWindow {
-    pub help_pane: Option<HelpPane>,
-    pub entries_pane: Entries,
-    pub mark_pane: Option<MarkPane>,
-    pub glob_pane: Option<GlobPane>,
+    pub help: Option<HelpPane>,
+    pub entries: Entries,
+    pub mark: Option<MarkPane>,
+    pub glob: Option<GlobPane>,
 }
 
 impl MainWindow {
@@ -53,16 +54,20 @@ impl MainWindow {
             state,
             config,
         } = props.borrow();
+        let language = state.language;
 
         let (entries_style, help_style, mark_style, glob_style) = pane_border_style(state.focussed);
         let (header_area, content_area, footer_area) = main_window_layout(area);
 
-        let header_bg_color = header_background_color(self.is_anything_marked(), state.focussed);
-        Header.render(header_bg_color, header_area, buffer);
+        let safety_notice = mark_safety_notice(state.read_only, &config.keys, language);
+
+        let header_bg_color =
+            header_background_color(self.has_marks() && safety_notice.is_none(), state.focussed);
+        Header::render(language, header_bg_color, header_area, buffer);
 
         let (entries_area, help_pane, mark_pane) = {
             let (left_pane, right_pane) = content_layout(content_area);
-            match (&mut self.help_pane, &mut self.mark_pane) {
+            match (&mut self.help, &mut self.mark) {
                 (Some(pane), None) => (left_pane, Some((right_pane, pane)), None),
                 (None, Some(pane)) => (left_pane, None, Some((right_pane, pane))),
                 (Some(help), Some(mark)) => {
@@ -73,7 +78,7 @@ impl MainWindow {
             }
         };
 
-        let (entries_area, glob_pane) = match &mut self.glob_pane {
+        let (entries_area, glob_pane) = match &mut self.glob {
             Some(glob_pane) => {
                 let regions = Layout::default()
                     .direction(Direction::Vertical)
@@ -88,6 +93,10 @@ impl MainWindow {
             let props = MarkPaneProps {
                 border_style: mark_style,
                 format: display.byte_format,
+                root_total_size: *total_bytes,
+                keys: &config.keys,
+                safety_notice,
+                language,
             };
             pane.render(props, mark_area, buffer);
         }
@@ -96,15 +105,17 @@ impl MainWindow {
             let props = HelpPaneProps {
                 border_style: help_style,
                 has_focus: matches!(state.focussed, Help),
-                esc_navigates_back: config.keys.esc_navigates_back,
+                keys: &config.keys,
+                language,
             };
             pane.render(props, help_area, buffer);
         }
 
-        let marked = self.mark_pane.as_ref().map(|p| p.marked());
+        let marked = self.mark.as_ref().map(|pane| pane.marked());
         let props = EntriesProps {
             current_path: current_path.clone(),
             display: *display,
+            directory_suffix: config.directory_suffix,
             entries: &state.entries,
             marked,
             cleanup_candidates: state.cleanup_candidates.as_ref(),
@@ -114,39 +125,46 @@ impl MainWindow {
             is_focussed: matches!(state.focussed, Main),
             sort_mode: state.sorting,
             show_columns: &state.show_columns,
+            keys: &config.keys,
+            language,
         };
-        self.entries_pane.render(props, entries_area, buffer);
+        self.entries.render(props, entries_area, buffer);
 
         if let Some((glob_area, pane)) = glob_pane {
             let props = GlobPaneProps {
                 border_style: glob_style,
                 has_focus: matches!(state.focussed, Glob),
+                keys: &config.keys,
+                language,
             };
             pane.render(props, glob_area, buffer, cursor);
         }
 
-        Footer.render(
+        Footer::render(
             FooterProps {
                 total_bytes: *total_bytes,
                 format: display.byte_format,
-                entries_traversed: *entries_traversed,
                 message: state.message.clone(),
-                traversal_start: *start,
-                elapsed: *elapsed,
+                traversal_stats: (state.scan.is_some() || !state.received_events).then_some((
+                    *entries_traversed,
+                    *start,
+                    *elapsed,
+                )),
                 sort_mode: state.sorting,
                 pending_exit: state.pending_exit,
-                esc_navigates_back: config.keys.esc_navigates_back,
+                keys: &config.keys,
+                language,
             },
             footer_area,
             buffer,
         );
     }
 
-    fn is_anything_marked(&self) -> bool {
-        self.mark_pane
+    fn has_marks(&self) -> bool {
+        self.mark
             .as_ref()
-            .map(|p| p.marked())
-            .is_none_or(|m| m.is_empty())
+            .map(|pane| pane.marked())
+            .is_some_and(|marked| !marked.is_empty())
     }
 }
 
@@ -166,11 +184,28 @@ fn content_layout(content_area: Rect) -> (Rect, Rect) {
     (regions[0], regions[1])
 }
 
-fn header_background_color(is_marked: bool, focused_pane: FocussedPane) -> Color {
-    match (is_marked, focused_pane) {
-        (false, Mark) => Color::LightRed,
-        (false, _) => COLOR_MARKED,
-        (_, _) => Color::White,
+fn mark_safety_notice(
+    read_only: bool,
+    keys: &dua::KeysConfig,
+    language: crate::interactive::widgets::Language,
+) -> Option<&'static str> {
+    let t = language.ui_text();
+    if read_only {
+        Some(t.mark_snapshot_read_only)
+    } else if keys.delete_marked.is_empty()
+        && (!cfg!(feature = "trash-move") || keys.trash_marked.is_empty())
+    {
+        Some(t.mark_no_destructive_keys)
+    } else {
+        None
+    }
+}
+
+fn header_background_color(has_dangerous_marks: bool, focused_pane: FocussedPane) -> Color {
+    match (has_dangerous_marks, focused_pane) {
+        (true, Mark) => Color::LightRed,
+        (true, _) => COLOR_MARKED,
+        (false, _) => Color::White,
     }
 }
 
@@ -195,5 +230,25 @@ fn pane_border_style(focused_pane: FocussedPane) -> (Style, Style, Style, Style)
         Help => (grey, bold, grey, grey),
         Mark => (grey, grey, bold, grey),
         Glob => (grey, grey, grey, bold),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interactive::widgets::Language;
+
+    #[test]
+    fn marks_are_only_dangerous_when_a_destructive_action_is_available() {
+        let config = dua::Config::default();
+        assert!(mark_safety_notice(false, &config.keys, Language::English).is_none());
+        assert_eq!(header_background_color(true, Mark), Color::LightRed);
+
+        assert!(mark_safety_notice(true, &config.keys, Language::English).is_some());
+        assert_eq!(header_background_color(false, Mark), Color::White);
+
+        let config: dua::Config =
+            toml::from_str("[keys]\ndelete_marked = []\ntrash_marked = []").expect("valid config");
+        assert!(mark_safety_notice(false, &config.keys, Language::English).is_some());
     }
 }

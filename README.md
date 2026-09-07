@@ -4,6 +4,8 @@
 
 **dua** (-> _Disk Usage Analyzer_) is a tool to conveniently learn about the usage of disk space of a given directory. It's parallel by default and will max out your SSD, providing relevant information as fast as possible. Optionally delete superfluous data, and do so more quickly than `rm`.
 
+Run `dua i` to launch the [interactive mode](#interactive-mode) for exploring and deleting files.
+
 [![asciicast](https://asciinema.org/a/kDnXUOeqBxZVMoWuFNqzfpeey.svg)](https://asciinema.org/a/kDnXUOeqBxZVMoWuFNqzfpeey)
 
 ### Installation
@@ -14,7 +16,7 @@
 
 ```sh
 curl -LSfs https://raw.githubusercontent.com/Byron/dua-cli/master/ci/install.sh | \
-    sh -s -- --git Byron/dua-cli --crate dua --tag v2.29.0
+    sh -s -- --git Byron/dua-cli --crate dua
 ```
 
 #### MacOS via [MacPorts](https://www.macports.org):
@@ -37,7 +39,7 @@ Linux requires the target to be specified explicitly to obtain the MUSL build.
 
 ```sh
 curl -LSfs https://raw.githubusercontent.com/Byron/dua-cli/master/ci/install.sh | \
-    sh -s -- --git Byron/dua-cli --target x86_64-unknown-linux-musl --crate dua --tag v2.29.0
+    sh -s -- --git Byron/dua-cli --target x86_64-unknown-linux-musl --crate dua
 ```
 
 #### Windows via [Scoop](https://scoop.sh/)
@@ -55,6 +57,13 @@ winget install Byron.dua-cli
 #### Pre-built Binaries
 
 See the [releases section][releases] for manual installation of a binary, pre-built for many platforms.
+
+Release archives include build provenance attestations. After downloading an archive, verify that it
+was built by this repository with the [GitHub CLI](https://cli.github.com/):
+
+```sh
+gh attestation verify ./dua-v2.39.1-aarch64-apple-darwin.tar.gz --repo Byron/dua-cli
+```
 
 [releases]: https://github.com/Byron/dua-cli/releases
 
@@ -167,6 +176,53 @@ dua *
 dua aggregate --help
 ```
 
+On macOS, the `--deduplicate-apfs-clones` traversal option counts fully shared
+APFS file clones only once in aggregate and interactive runs. It is opt-in
+because collecting the additional metadata reduces traversal performance by
+about 6%.
+Files that share only some blocks are not deduplicated, and `--apparent-size`
+still reports each file's logical length.
+
+### Tree output
+
+By default `aggregate` prints a flat listing. Pass `--depth N` to instead print an indented tree
+that descends `N` levels into each input, which is handy for sharing a disk-usage report without
+opening interactive mode. The inputs form the first level, so `--depth 1` lists just them, the same
+set of entries the flat listing shows.
+
+```bash
+# show each top-level entry and one level below it
+dua aggregate --depth 2
+```
+
+`--no-sort` and `--no-total` work the same way they do for the flat listing.
+
+### Excluding paths with a pattern file
+
+`--ignore-from FILE` reads gitignore-style patterns and leaves everything they match out of the
+report, in both aggregate and interactive mode. This is the `--exclude-from` of `rsync` and the
+`--exclude-file` of `restic`, so the same file can answer "how much of this would actually get
+backed up?".
+
+```bash
+cat .duaignore
+# /target/
+# **/node_modules/
+# *.log
+# !important.log
+
+dua --ignore-from .duaignore
+```
+
+Patterns follow `.gitignore` syntax - `#` comments, a trailing `/` to match directories only, a
+leading `/` to anchor to the current working directory or the traversal root, `**` to span directories,
+and `!` to re-include something an earlier pattern excluded. They match the paths `dua` reports, 
+which are relative to the directory being looked at, and matching is case-sensitive on every platform.
+
+The option can be given more than once, in which case later files win over earlier ones, and it
+can also be set through `DUA_IGNORE_FROM`. Excluded directories are not descended into at all, so
+their contents cannot be re-included - the same restriction Git has.
+
 ### Interactive Mode
 
 Launch into interactive mode with the `i` or `interactive` subcommand. Get help on keyboard
@@ -181,12 +237,37 @@ dua i
 dua interactive
 ```
 
-The help screen can be localized via the standard POSIX locale environment variables, in the
-usual order of precedence `LC_ALL` > `LC_MESSAGES` > `LANG`. English is the default; currently
-Japanese (`ja`) is also available when the locale uses UTF-8 or omits the codeset:
+The interactive interface can be localized via the standard POSIX locale environment variables,
+in the usual order of precedence `LC_ALL` > `LC_MESSAGES` > `LANG`. English is the default; German
+(`de`), Japanese (`ja`), Korean (`ko`), and Simplified Chinese (`zh`, `zh_CN`, `zh_SG`, or
+`zh_Hans`) are also available when the locale uses UTF-8 or omits the codeset:
+
+Please [open an issue](https://github.com/Byron/dua-cli/issues/new) to request support for your
+language, if you would be available for reviewing it as well.
 
 ```bash
-LANG=ja_JP.UTF-8 dua i   # then press '?' for the Japanese help screen
+LANG=de_DE.UTF-8 dua i   # German interface
+LANG=ja_JP.UTF-8 dua i   # Japanese interface
+LANG=ko_KR.UTF-8 dua i   # Korean interface
+LANG=zh_CN.UTF-8 dua i   # Simplified Chinese interface
+```
+
+### Flame graphs
+
+`dua stacks` prints folded stacks—the "collapsed" interchange format read by flame-graph tools.
+Each line is an entry's path with `;` between its components, a space, and its size in bytes:
+
+```bash
+dua stacks > disk-usage.folded
+```
+
+`dua flamegraph` renders the same data with [`inferno`](https://github.com/jonhoo/inferno), writes
+the SVG to a temporary file, and opens it. Pass an output path to write the SVG without opening it.
+Both commands accept the usual traversal options as well as `--depth` and `--import`:
+
+```bash
+dua flamegraph
+dua flamegraph -o disk-usage.svg
 ```
 
 ### Configuration
@@ -199,14 +280,22 @@ LANG=ja_JP.UTF-8 dua i   # then press '?' for the Japanese help screen
 
 If the file is missing, defaults are used.
 
-Currently supported options:
+Run `dua config show-default` for a commented template containing every configurable keybinding.
+Use a string for one binding or an array for aliases; an empty array disables the action.
+For example:
 
 ```toml
 [keys]
-# If true, pressing <Esc> in the main pane navigates to the parent directory.
-# If true (default), pressing <Esc> in the main pane ascends to the parent directory.
-# If false, <Esc> follows the default quit behavior.
+# If true (default), close_pane keys ascend from the main pane.
+# If false, close_pane keys follow the quit behavior.
 esc_navigates_back = true
+
+close_pane = "esc"
+sort_by_name = "ctrl+n"
+
+# Disable permanent deletion and moving entries to the trash.
+delete_marked = []
+trash_marked = []
 ```
 
 ### Development
@@ -232,10 +321,6 @@ make
 Maintaining both backends seemed more cumbersome than it's worth and add complexity I didn't like anymore. `termion` had its benefits,
 but I never liked that it seems to have dropped out of support.
 Thus `crossterm` is the only remaining backend and it's very actively developed.
-
-### Acknowledgements
-
-Thanks to [jwalk][jwalk], all there was left to do is to write a command-line interface. As `jwalk` matures, **dua** should benefit instantly.
 
 ### Limitations
 
@@ -274,5 +359,4 @@ Thanks to [jwalk][jwalk], all there was left to do is to write a command-line in
 
 [petgraph]: https://crates.io/crates/petgraph
 [rustup]: https://rustup.rs/
-[jwalk]: https://crates.io/crates/jwalk
 [tui]: https://github.com/fdehau/tui-rs

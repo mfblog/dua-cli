@@ -1,7 +1,5 @@
 use crate::interactive::path_of;
 use dua::traverse::{Tree, TreeIndex};
-use itertools::Itertools;
-use petgraph::Direction;
 use std::time::SystemTime;
 use std::{cmp::Ordering, path::PathBuf};
 use unicode_segmentation::UnicodeSegmentation;
@@ -20,7 +18,7 @@ pub enum MTimeSort {
 
 impl MTimeSort {
     fn cycle(self) -> Self {
-        use MTimeSort::*;
+        use MTimeSort::{Entry, RecursiveChildrenNewest, RecursiveChildrenOldest};
         match self {
             Entry => RecursiveChildrenNewest,
             RecursiveChildrenNewest => RecursiveChildrenOldest,
@@ -44,16 +42,15 @@ pub enum SortMode {
 
 impl SortMode {
     pub fn toggle_size(&mut self) {
-        use SortMode::*;
+        use SortMode::{SizeAscending, SizeDescending};
         *self = match self {
             SizeDescending => SizeAscending,
-            SizeAscending => SizeDescending,
             _ => SizeDescending,
         }
     }
 
     pub fn toggle_mtime(&mut self) {
-        use SortMode::*;
+        use SortMode::{MTimeAscending, MTimeDescending};
         *self = match self {
             MTimeAscending(sort) => MTimeDescending(*sort),
             MTimeDescending(sort) => MTimeAscending(*sort),
@@ -78,19 +75,17 @@ impl SortMode {
     }
 
     pub fn toggle_count(&mut self) {
-        use SortMode::*;
+        use SortMode::{CountAscending, CountDescending};
         *self = match self {
-            CountAscending => CountDescending,
             CountDescending => CountAscending,
             _ => CountDescending,
         }
     }
 
     pub fn toggle_name(&mut self) {
-        use SortMode::*;
+        use SortMode::{NameAscending, NameDescending};
         *self = match self {
             NameAscending => NameDescending,
-            NameDescending => NameAscending,
             _ => NameAscending,
         }
     }
@@ -140,10 +135,13 @@ pub fn sorted_entries(
     node_idx: TreeIndex,
     sorting: SortMode,
     glob_root: Option<TreeIndex>,
+    glob_matches: Option<&[TreeIndex]>,
     check: EntryCheck,
 ) -> Vec<EntryDataBundle> {
-    use SortMode::*;
-    let mtime_sort = sorting.mtime_sort().unwrap_or_default();
+    use SortMode::{
+        CountAscending, CountDescending, MTimeAscending, MTimeDescending, NameAscending,
+        NameDescending, SizeAscending, SizeDescending,
+    };
     fn cmp_count(l: &EntryDataBundle, r: &EntryDataBundle) -> Ordering {
         l.entry_count
             .cmp(&r.entry_count)
@@ -158,17 +156,26 @@ pub fn sorted_entries(
             l.name.cmp(&r.name)
         }
     }
-    tree.neighbors_directed(node_idx, Direction::Outgoing)
+    let mtime_sort = sorting.mtime_sort().unwrap_or_default();
+    let use_glob_path = glob_root == Some(node_idx);
+    let indices = if use_glob_path {
+        glob_matches.unwrap_or_default().to_vec()
+    } else {
+        tree.children(node_idx).collect()
+    };
+    let mut entries = indices
+        .into_iter()
         .filter_map(|idx| {
-            tree.node_weight(idx).map(|entry| {
-                let use_glob_path = glob_root.is_some_and(|glob_root| glob_root == node_idx);
+            tree.entry(idx).map(|entry| {
+                let data = entry.data;
                 let (path, exists, is_dir) = {
                     let path = path_of(tree, idx, glob_root);
                     if matches!(check, EntryCheck::Disabled) || glob_root == Some(node_idx) {
-                        (path, true, entry.is_dir)
+                        (path, true, data.is_dir)
                     } else {
                         let meta = path.symlink_metadata();
-                        (path, meta.is_ok(), meta.ok().is_some_and(|m| m.is_dir()))
+                        let exists = meta.is_ok();
+                        (path, exists, meta.is_ok_and(|m| m.is_dir()))
                     }
                 };
                 EntryDataBundle {
@@ -176,27 +183,28 @@ pub fn sorted_entries(
                     name: if use_glob_path {
                         path
                     } else {
-                        entry.name.clone()
+                        entry.name.into_owned()
                     },
-                    size: entry.size,
-                    mtime: mtime_for_sort(tree, idx, entry.mtime, mtime_sort),
-                    entry_count: entry.entry_count,
+                    size: data.size,
+                    mtime: mtime_for_sort(tree, idx, data.mtime, mtime_sort),
+                    entry_count: data.entry_count,
                     exists,
                     is_dir,
                 }
             })
         })
-        .sorted_by(|l, r| match sorting {
-            SizeDescending => r.size.cmp(&l.size),
-            SizeAscending => l.size.cmp(&r.size),
-            MTimeAscending(_) => l.mtime.cmp(&r.mtime),
-            MTimeDescending(_) => r.mtime.cmp(&l.mtime),
-            CountAscending => cmp_count(l, r),
-            CountDescending => cmp_count(l, r).reverse(),
-            NameAscending => cmp_name(l, r),
-            NameDescending => cmp_name(l, r).reverse(),
-        })
-        .collect()
+        .collect::<Vec<_>>();
+    entries.sort_by(|l, r| match sorting {
+        SizeDescending => r.size.cmp(&l.size),
+        SizeAscending => l.size.cmp(&r.size),
+        MTimeAscending(_) => l.mtime.cmp(&r.mtime),
+        MTimeDescending(_) => r.mtime.cmp(&l.mtime),
+        CountAscending => cmp_count(l, r),
+        CountDescending => cmp_count(l, r).reverse(),
+        NameAscending => cmp_name(l, r),
+        NameDescending => cmp_name(l, r).reverse(),
+    });
+    entries
 }
 
 fn mtime_for_sort(
@@ -205,7 +213,7 @@ fn mtime_for_sort(
     entry_mtime: SystemTime,
     sort: MTimeSort,
 ) -> SystemTime {
-    use MTimeSort::*;
+    use MTimeSort::{Entry, RecursiveChildrenNewest, RecursiveChildrenOldest};
     match sort {
         Entry => entry_mtime,
         RecursiveChildrenNewest => max_mtime_of_descendants(tree, node_idx).unwrap_or(entry_mtime),
@@ -226,12 +234,10 @@ fn mtime_of_descendants_with_ordering(
     node_idx: TreeIndex,
     ordering: Ordering,
 ) -> Option<SystemTime> {
-    let mut stack: Vec<_> = tree
-        .neighbors_directed(node_idx, Direction::Outgoing)
-        .collect();
+    let mut stack: Vec<_> = tree.children(node_idx).collect();
     let mut selected_mtime: Option<SystemTime> = None;
     while let Some(idx) = stack.pop() {
-        if let Some(entry) = tree.node_weight(idx) {
+        if let Some(entry) = tree.entry(idx) {
             selected_mtime = Some(selected_mtime.map_or(entry.mtime, |selected| {
                 if entry.mtime.cmp(&selected) == ordering {
                     entry.mtime
@@ -239,7 +245,7 @@ fn mtime_of_descendants_with_ordering(
                     selected
                 }
             }));
-            stack.extend(tree.neighbors_directed(idx, Direction::Outgoing));
+            stack.extend(tree.children(idx));
         }
     }
     selected_mtime

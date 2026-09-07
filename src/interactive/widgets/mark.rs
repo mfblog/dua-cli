@@ -4,11 +4,13 @@ use crate::interactive::widgets::tui_ext::{
     util::{block_width, rect, rect::line_bound},
 };
 use crate::interactive::{
-    CursorDirection, app::tree_view::TreeView, fit_string_graphemes_with_ellipsis,
-    widgets::entry_color,
+    CursorDirection,
+    app::tree_view::TreeView,
+    fit_string_graphemes_with_ellipsis,
+    widgets::{Language, entry_color},
 };
-use crossterm::event::{KeyEvent, KeyEventKind, KeyModifiers};
-use dua::{ByteFormat, traverse::TreeIndex};
+use crossterm::event::{KeyEvent, KeyEventKind};
+use dua::{ByteFormat, KeysConfig, traverse::TreeIndex};
 use itertools::Itertools;
 use std::{
     borrow::Borrow,
@@ -56,9 +58,13 @@ pub struct MarkPane {
     item_count: u64,
 }
 
-pub struct MarkPaneProps {
+pub struct MarkPaneProps<'a> {
     pub border_style: Style,
     pub format: ByteFormat,
+    pub root_total_size: u128,
+    pub keys: &'a KeysConfig,
+    pub safety_notice: Option<&'static str>,
+    pub language: Language,
 }
 
 impl MarkPane {
@@ -71,7 +77,7 @@ impl MarkPane {
         if has_focus {
             self.selected = Some(self.marked.len().saturating_sub(1));
         } else {
-            self.selected = None
+            self.selected = None;
         }
     }
     pub fn toggle_index(
@@ -83,7 +89,7 @@ impl MarkPane {
     ) -> Option<Self> {
         match self.marked.entry(index) {
             Entry::Vacant(entry) => {
-                if let Some(e) = tree_view.tree().node_weight(index) {
+                if let Some(e) = tree_view.tree().entry(index) {
                     let sorting_index = self.last_sorting_index + 1;
                     self.last_sorting_index = sorting_index;
                     entry.insert(EntryMark {
@@ -101,7 +107,7 @@ impl MarkPane {
                     entry.remove();
                 }
             }
-        };
+        }
         if self.marked.is_empty() {
             None
         } else {
@@ -115,38 +121,40 @@ impl MarkPane {
     pub fn into_paths(self) -> impl Iterator<Item = PathBuf> {
         self.marked.into_values().map(|v| v.path)
     }
-    pub fn process_events(mut self, key: KeyEvent) -> Option<(Self, Option<MarkMode>)> {
-        use crossterm::event::KeyCode::*;
+    pub fn process_events(
+        mut self,
+        key: KeyEvent,
+        keys: &KeysConfig,
+    ) -> Option<(Self, Option<MarkMode>)> {
         let action = None;
         if key.kind == KeyEventKind::Release {
             return Some((self, action));
         }
-        match key.code {
-            Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return Some(self.prepare_deletion(MarkMode::Delete));
-            }
-            #[cfg(feature = "trash-move")]
-            Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return Some(self.prepare_deletion(MarkMode::Trash));
-            }
-            Char('a') => return None,
-            Char('H') => self.change_selection(CursorDirection::ToTop),
-            Char('G') => self.change_selection(CursorDirection::ToBottom),
-            PageUp => self.change_selection(CursorDirection::PageUp),
-            Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.change_selection(CursorDirection::PageUp)
-            }
-            Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.change_selection(CursorDirection::PageDown)
-            }
-            PageDown => self.change_selection(CursorDirection::PageDown),
-            Char('k') | Up => self.change_selection(CursorDirection::Up),
-            Char('j') | Down => self.change_selection(CursorDirection::Down),
-            Char('x') | Char('d') | Char(' ') => {
-                return self.remove_selected().map(|s| (s, action));
-            }
-            _ => {}
-        };
+        if keys.delete_marked.matches(key) {
+            return Some(self.prepare_deletion(MarkMode::Delete));
+        }
+        #[cfg(feature = "trash-move")]
+        if keys.trash_marked.matches(key) {
+            return Some(self.prepare_deletion(MarkMode::Trash));
+        }
+        if keys.remove_all_marks.matches(key) {
+            return None;
+        }
+        if keys.move_to_top.matches(key) {
+            self.change_selection(CursorDirection::ToTop);
+        } else if keys.move_to_bottom.matches(key) {
+            self.change_selection(CursorDirection::ToBottom);
+        } else if keys.page_up.matches(key) {
+            self.change_selection(CursorDirection::PageUp);
+        } else if keys.page_down.matches(key) {
+            self.change_selection(CursorDirection::PageDown);
+        } else if keys.move_up.matches(key) {
+            self.change_selection(CursorDirection::Up);
+        } else if keys.move_down.matches(key) {
+            self.change_selection(CursorDirection::Down);
+        } else if keys.remove_mark.matches(key) {
+            return self.remove_selected().map(|s| (s, action));
+        }
         Some((self, action))
     }
 
@@ -159,14 +167,11 @@ impl MarkPane {
                 Some(entry_to_delete) => match delete_fn(self, entry_to_delete) {
                     Ok(pane) => {
                         self = pane;
-                        match self.delete_entry() {
-                            Some(p) => self = p,
-                            None => return None,
-                        }
+                        self = self.delete_entry()?;
                     }
                     Err((pane, num_errors)) => {
                         self = pane;
-                        self.set_error_on_marked_item(num_errors)
+                        self.set_error_on_marked_item(num_errors);
                     }
                 },
                 None => return Some(self),
@@ -179,16 +184,17 @@ impl MarkPane {
             self.tree_index_by_list_position(selected)
                 .and_then(|idx| self.marked.get(&idx).map(|d| (selected, idx, d)))
         }) {
-            Some((position, selected_index, data)) => match data.num_errors_during_deletion {
-                0 => Some(selected_index),
-                _ => {
+            Some((position, selected_index, data)) => {
+                if data.num_errors_during_deletion == 0 {
+                    Some(selected_index)
+                } else {
                     self.selected = match position + 1 {
                         p if p < self.marked.len() => Some(p),
                         _ => Some(self.marked.len().saturating_sub(1)),
                     };
                     self.tree_index_by_list_position(position + 1)
                 }
-            },
+            }
             None => None,
         }
     }
@@ -251,17 +257,32 @@ impl MarkPane {
         });
     }
 
-    pub fn render(&mut self, props: impl Borrow<MarkPaneProps>, area: Rect, buf: &mut Buffer) {
+    pub fn render<'a>(
+        &mut self,
+        props: impl Borrow<MarkPaneProps<'a>>,
+        area: Rect,
+        buf: &mut Buffer,
+    ) {
         let MarkPaneProps {
             border_style,
             format,
+            root_total_size,
+            keys,
+            safety_notice,
+            language,
         } = props.borrow();
 
         let marked: &_ = &self.marked;
-        let title = format!(
-            "Marked {} items ({}) ",
-            COUNT.format(self.item_count as f64),
-            format.display(self.total_size)
+        let percentage = if *root_total_size == 0 {
+            0.0
+        } else {
+            self.total_size as f64 / *root_total_size as f64 * 100.0
+        };
+        let title = language.marked_title(
+            &COUNT.format(self.item_count as f64),
+            &format.display(self.total_size).to_string(),
+            percentage,
+            &format.display(*root_total_size).to_string(),
         );
         let selected = self.selected;
         let has_focus = self.has_focus;
@@ -285,9 +306,9 @@ impl MarkPane {
                         " {}  {}",
                         v.path.display(),
                         if v.num_errors_during_deletion != 0 {
-                            format!("{} IO deletion errors", v.num_errors_during_deletion)
+                            language.deletion_errors(v.num_errors_during_deletion)
                         } else {
-                            "".to_string()
+                            String::new()
                         }
                     );
                     let num_path_graphemes = path.graphemes(true).count();
@@ -340,12 +361,11 @@ impl MarkPane {
             },
         );
 
-        let entry_in_view = match self.selected {
-            Some(s) => Some(s),
-            None => {
-                self.list.offset = 0;
-                Some(marked.len().saturating_sub(1))
-            }
+        let entry_in_view = if let Some(s) = self.selected {
+            Some(s)
+        } else {
+            self.list.offset = 0;
+            Some(marked.len().saturating_sub(1))
         };
         let block = Block::default()
             .title(title.as_str())
@@ -371,9 +391,10 @@ impl MarkPane {
                     .constraints(constraints)
                     .split(inner_area);
 
-                match help_at_bottom {
-                    true => (regions[1], regions[0]),
-                    false => (regions[0], regions[1]),
+                if help_at_bottom {
+                    (regions[1], regions[0])
+                } else {
+                    (regions[0], regions[1])
                 }
             };
 
@@ -382,32 +403,38 @@ impl MarkPane {
                 bg: Color::Yellow.into(),
                 add_modifier: Modifier::BOLD,
                 sub_modifier: Modifier::empty(),
+                ..Style::default()
             };
-            Paragraph::new(Text::from(Line::from(vec![
-                #[cfg(feature = "trash-move")]
-                Span::styled(
-                    " Ctrl + t ",
-                    Style {
-                        fg: Color::White.into(),
-                        bg: Color::Black.into(),
-                        ..default_style
-                    },
-                ),
-                #[cfg(feature = "trash-move")]
-                Span::styled(" to trash or ", default_style),
-                Span::styled(
-                    " Ctrl + r ",
-                    Style {
-                        fg: Color::LightRed.into(),
-                        bg: Color::Black.into(),
-                        add_modifier: default_style.add_modifier | Modifier::RAPID_BLINK,
-                        ..default_style
-                    },
-                ),
-                Span::styled(" to delete without prompt", default_style),
-            ])))
-            .style(default_style)
-            .render(help_line_area, buf);
+            let t = language.ui_text();
+            if let Some(notice) = safety_notice {
+                Paragraph::new(*notice).render(help_line_area, buf);
+            } else {
+                Paragraph::new(Text::from(Line::from(vec![
+                    #[cfg(feature = "trash-move")]
+                    Span::styled(
+                        format!(" {} ", keys.trash_marked),
+                        Style {
+                            fg: Color::White.into(),
+                            bg: Color::Black.into(),
+                            ..default_style
+                        },
+                    ),
+                    #[cfg(feature = "trash-move")]
+                    Span::styled(t.mark_to_trash_or, default_style),
+                    Span::styled(
+                        format!(" {} ", keys.delete_marked),
+                        Style {
+                            fg: Color::LightRed.into(),
+                            bg: Color::Black.into(),
+                            add_modifier: default_style.add_modifier | Modifier::RAPID_BLINK,
+                            ..default_style
+                        },
+                    ),
+                    Span::styled(t.mark_to_delete, default_style),
+                ])))
+                .style(default_style)
+                .render(help_line_area, buf);
+            }
             list_area
         } else {
             inner_area
@@ -441,8 +468,15 @@ impl MarkPane {
         );
 
         if has_focus {
-            let help_text = " . = o|.. = u ── ⇊ = Ctrl+d|↓ = j|⇈ = Ctrl+u|↑ = k ";
-            let help_text_block_width = block_width(help_text);
+            let t = language.ui_text();
+            let help_text = format!(
+                " ⇊ = {}|↓ = {}|⇈ = {}|↑ = {} ",
+                keys.page_down.primary(),
+                keys.move_down.primary(),
+                keys.page_up.primary(),
+                keys.move_up.primary(),
+            );
+            let help_text_block_width = block_width(&help_text);
             let bound = Rect {
                 width: area.width.saturating_sub(1),
                 ..area
@@ -451,18 +485,21 @@ impl MarkPane {
                 draw_text_nowrap_fn(
                     rect::snap_to_right(bound, help_text_block_width),
                     buf,
-                    help_text,
+                    &help_text,
                     |_, _, _| Style::default(),
                 );
             }
             let bound = line_bound(bound, bound.height.saturating_sub(1) as usize);
-            let help_text = " mark-toggle = space,d | remove-all = a";
-            let help_text_block_width = block_width(help_text);
+            let help_text = format!(
+                " {} = {} | {} = {}",
+                t.mark_toggle, keys.remove_mark, t.mark_remove_all, keys.remove_all_marks
+            );
+            let help_text_block_width = block_width(&help_text);
             if help_text_block_width <= bound.width {
                 draw_text_nowrap_fn(
                     rect::snap_to_right(bound, help_text_block_width),
                     buf,
-                    help_text,
+                    &help_text,
                     |_, _, _| Style::default(),
                 );
             }
@@ -497,6 +534,218 @@ pub fn calculate_size_and_count(marked: &EntryMarkMap) -> (u128, u64) {
 #[cfg(test)]
 mod mark_pane_tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use tui::buffer::Cell;
+
+    #[test]
+    fn title_shows_percentage_of_root_size() {
+        let area = Rect::new(0, 0, 80, 4);
+        let mut buffer = Buffer::empty(area);
+        MarkPane {
+            total_size: 312_400_000,
+            item_count: 20_000,
+            ..Default::default()
+        }
+        .render(
+            MarkPaneProps {
+                border_style: Style::default(),
+                format: ByteFormat::Metric,
+                keys: &KeysConfig::default(),
+                root_total_size: 1_000_000_000,
+                safety_notice: None,
+                language: Language::English,
+            },
+            area,
+            &mut buffer,
+        );
+
+        insta::assert_debug_snapshot!(
+            buffer,
+            "marked item count, size and percentage of root size",
+            @r#"
+        Buffer {
+            area: Rect { x: 0, y: 0, width: 80, height: 4 },
+            content: [
+                "┌Marked 20K items (312.40 MB, 31.24% of 1.00 GB) ──────────────────────────────┐",
+                "│                                                                              │",
+                "│                                                                              │",
+                "└──────────────────────────────────────────────────────────────────────────────┘",
+            ],
+            styles: [
+                x: 0, y: 0, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
+            ]
+        }
+        "#
+        );
+    }
+
+    #[test]
+    fn unmapped_delete_key_is_named() {
+        let area = Rect::new(0, 0, 80, 4);
+        let mut buffer = Buffer::empty(area);
+        let config: dua::Config =
+            toml::from_str("[keys]\ndelete_marked = []").expect("valid config");
+
+        MarkPane {
+            has_focus: true,
+            ..Default::default()
+        }
+        .render(
+            MarkPaneProps {
+                border_style: Style::default(),
+                format: ByteFormat::Metric,
+                keys: &config.keys,
+                root_total_size: 0,
+                safety_notice: None,
+                language: Language::English,
+            },
+            area,
+            &mut buffer,
+        );
+
+        #[cfg(feature = "trash-move")]
+        insta::assert_debug_snapshot!(
+            buffer,
+            "unmapped permanent-delete key alongside trash support",
+            @r#"
+        Buffer {
+            area: Rect { x: 0, y: 0, width: 80, height: 4 },
+            content: [
+                "┌Marked 0 items (0  B, 0.00% of 0  B) ── ⇊ = Ctrl + d|↓ = j|⇈ = Ctrl + u|↑ = k ┐",
+                "│                                                                              │",
+                "│ Ctrl + t  to trash or  <unmapped>  to delete without prompt                  │",
+                "└─────────────────────────────────── mark-toggle = x/d/<Space> | remove-all = a┘",
+            ],
+            styles: [
+                x: 0, y: 0, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
+                x: 1, y: 2, fg: White, bg: Black, underline: Reset, modifier: BOLD,
+                x: 11, y: 2, fg: Black, bg: Yellow, underline: Reset, modifier: BOLD,
+                x: 24, y: 2, fg: LightRed, bg: Black, underline: Reset, modifier: BOLD | RAPID_BLINK,
+                x: 36, y: 2, fg: Black, bg: Yellow, underline: Reset, modifier: BOLD,
+                x: 79, y: 2, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
+            ]
+        }
+        "#
+        );
+        #[cfg(not(feature = "trash-move"))]
+        insta::assert_debug_snapshot!(
+            buffer,
+            "unmapped permanent-delete key without trash support",
+            @r#"
+        Buffer {
+            area: Rect { x: 0, y: 0, width: 80, height: 4 },
+            content: [
+                "┌Marked 0 items (0  B, 0.00% of 0  B) ── ⇊ = Ctrl + d|↓ = j|⇈ = Ctrl + u|↑ = k ┐",
+                "│                                                                              │",
+                "│ <unmapped>  to delete without prompt                                         │",
+                "└─────────────────────────────────── mark-toggle = x/d/<Space> | remove-all = a┘",
+            ],
+            styles: [
+                x: 0, y: 0, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
+                x: 1, y: 2, fg: LightRed, bg: Black, underline: Reset, modifier: BOLD | RAPID_BLINK,
+                x: 13, y: 2, fg: Black, bg: Yellow, underline: Reset, modifier: BOLD,
+                x: 79, y: 2, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
+            ]
+        }
+        "#
+        );
+    }
+
+    #[test]
+    fn safety_notice_replaces_the_danger_prompt() {
+        let area = Rect::new(0, 0, 80, 4);
+        let mut buffer = Buffer::empty(area);
+
+        MarkPane {
+            has_focus: true,
+            ..Default::default()
+        }
+        .render(
+            MarkPaneProps {
+                border_style: Style::default(),
+                format: ByteFormat::Metric,
+                keys: &KeysConfig::default(),
+                root_total_size: 0,
+                safety_notice: Some(" Snapshot is read-only; marked entries cannot be deleted "),
+                language: Language::English,
+            },
+            area,
+            &mut buffer,
+        );
+
+        insta::assert_debug_snapshot!(
+            buffer,
+            "read-only notice replaces destructive prompt and styling",
+            @r#"
+        Buffer {
+            area: Rect { x: 0, y: 0, width: 80, height: 4 },
+            content: [
+                "┌Marked 0 items (0  B, 0.00% of 0  B) ── ⇊ = Ctrl + d|↓ = j|⇈ = Ctrl + u|↑ = k ┐",
+                "│                                                                              │",
+                "│ Snapshot is read-only; marked entries cannot be deleted                      │",
+                "└─────────────────────────────────── mark-toggle = x/d/<Space> | remove-all = a┘",
+            ],
+            styles: [
+                x: 0, y: 0, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
+            ]
+        }
+        "#
+        );
+    }
+
+    #[test]
+    fn title_prompt_and_actions_follow_the_selected_language() {
+        let area = Rect::new(0, 0, 120, 4);
+        let mut buffer = Buffer::empty(area);
+
+        MarkPane {
+            has_focus: true,
+            ..Default::default()
+        }
+        .render(
+            MarkPaneProps {
+                border_style: Style::default(),
+                format: ByteFormat::Metric,
+                keys: &KeysConfig::default(),
+                root_total_size: 0,
+                safety_notice: None,
+                language: Language::Korean,
+            },
+            area,
+            &mut buffer,
+        );
+
+        let rendered: String = buffer.content.iter().map(Cell::symbol).collect();
+        let rendered: String = rendered.split_whitespace().collect();
+        assert!(rendered.contains("표시된항목0개"));
+        assert!(rendered.contains("확인없이삭제"));
+        assert!(rendered.contains("표시전환"));
+        assert!(rendered.contains("모두해제"));
+        assert!(!rendered.contains("Marked"));
+    }
+
+    #[test]
+    fn process_events_uses_configured_keybindings() {
+        let config: dua::Config = toml::from_str(
+            r#"
+            [keys]
+            delete_marked = ["z"]
+            "#,
+        )
+        .expect("valid config");
+
+        assert!(matches!(
+            MarkPane::default().process_events(KeyCode::Char('z').into(), &config.keys),
+            Some((_, Some(MarkMode::Delete)))
+        ));
+        assert!(matches!(
+            MarkPane::default().process_events(
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+                &config.keys
+            ),
+            Some((_, None))
+        ));
+    }
 
     #[test]
     fn test_calculate_size() {

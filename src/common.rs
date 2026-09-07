@@ -1,6 +1,10 @@
-use crate::crossdev;
-use crate::traverse::{EntryData, Tree, TreeIndex};
-use byte_unit::{ByteUnit, n_gb_bytes, n_gib_bytes, n_mb_bytes, n_mib_bytes};
+#[cfg(any(windows, target_os = "macos"))]
+use crate::walk::walk_root_entries as walk_roots;
+#[cfg(not(any(windows, target_os = "macos")))]
+use crate::walk::walk_roots;
+use crate::{crossdev, walk};
+use anyhow::Context;
+use byte_unit::{Byte, Unit, UnitType};
 use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -8,16 +12,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::{fmt, path::Path};
-
-/// Return the entry at `node_idx` or panic if the index is invalid for `tree`.
-pub(crate) fn get_entry_or_panic(tree: &Tree, node_idx: TreeIndex) -> &EntryData {
-    tree.node_weight(node_idx)
-        .expect("node should always be retrievable with valid index")
-}
-
-pub(crate) fn get_size_or_panic(tree: &Tree, node_idx: TreeIndex) -> u128 {
-    get_entry_or_panic(tree, node_idx).size
-}
 
 /// Specifies a way to format bytes
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -47,19 +41,19 @@ pub enum ByteFormat {
 
 impl ByteFormat {
     /// Return the content width (without unit suffix) needed to display values in this format.
+    #[must_use]
     pub fn width(self) -> usize {
-        use ByteFormat::*;
+        use ByteFormat::{Binary, Bytes, MB, MiB};
         match self {
-            Metric => 10,
             Binary => 11,
-            Bytes => 12,
-            MiB | MB => 12,
+            Bytes | MB | MiB => 12,
             _ => 10,
         }
     }
     /// Return the full width (value plus unit and separator) used by this format.
+    #[must_use]
     pub fn total_width(self) -> usize {
-        use ByteFormat::*;
+        use ByteFormat::{Binary, Bytes, GB, GiB, MB, Metric, MiB};
         const THE_SPACE_BETWEEN_UNIT_AND_NUMBER: usize = 1;
 
         self.width()
@@ -71,6 +65,7 @@ impl ByteFormat {
             + THE_SPACE_BETWEEN_UNIT_AND_NUMBER
     }
     /// Create a display adapter for `bytes` using this format.
+    #[must_use]
     pub fn display(self, bytes: u128) -> impl fmt::Display {
         ByteFormatDisplay {
             format: self,
@@ -87,26 +82,24 @@ struct ByteFormatDisplay {
 
 impl fmt::Display for ByteFormatDisplay {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        use ByteFormat::*;
-        use byte_unit::Byte;
+        use ByteFormat::{Binary, Bytes, GB, GiB, MB, Metric, MiB};
 
-        let format = match self.format {
-            Bytes => return write!(f, "{} b", self.bytes),
-            Binary => (true, None),
-            Metric => (false, None),
-            GB => (false, Some((n_gb_bytes!(1), ByteUnit::GB))),
-            GiB => (false, Some((n_gib_bytes!(1), ByteUnit::GiB))),
-            MB => (false, Some((n_mb_bytes!(1), ByteUnit::MB))),
-            MiB => (false, Some((n_mib_bytes!(1), ByteUnit::MiB))),
-        };
-
-        let b = match format {
-            (_, Some((divisor, unit))) => Byte::from_unit(self.bytes as f64 / divisor as f64, unit)
-                .expect("byte count > 0")
-                .get_adjusted_unit(unit),
-            (binary, None) => Byte::from_bytes(self.bytes).get_appropriate_unit(binary),
+        if self.format == Bytes {
+            return write!(f, "{} b", self.bytes);
         }
-        .format(2);
+        let Some(bytes) = Byte::from_u128(self.bytes) else {
+            return write!(f, "{} b", self.bytes);
+        };
+        let adjusted = match self.format {
+            Bytes => unreachable!("handled above"),
+            Binary => bytes.get_appropriate_unit(UnitType::Binary),
+            Metric => bytes.get_appropriate_unit(UnitType::Decimal),
+            GB => bytes.get_adjusted_unit(Unit::GB),
+            GiB => bytes.get_adjusted_unit(Unit::GiB),
+            MB => bytes.get_adjusted_unit(Unit::MB),
+            MiB => bytes.get_adjusted_unit(Unit::MiB),
+        };
+        let b = format!("{adjusted:.2}");
         let mut splits = b.split(' ');
         match (splits.next(), splits.next()) {
             (Some(bytes), Some(unit)) => write!(
@@ -116,22 +109,12 @@ impl fmt::Display for ByteFormatDisplay {
                 unit,
                 unit_width = match self.format {
                     Binary => 3,
-                    Metric => 2,
                     _ => 2,
                 }
             ),
             _ => f.write_str(&b),
         }
     }
-}
-
-/// Identify the kind of sorting to apply during filesystem iteration
-#[derive(Clone)]
-pub enum TraversalSorting {
-    /// Keep filesystem iteration order as provided by the walker.
-    None,
-    /// Sort entries alphabetically by file name during iteration.
-    AlphabeticalByFileName,
 }
 
 /// Throttle access to an optional `io::Write` to the specified `Duration`
@@ -146,13 +129,13 @@ impl Throttle {
     /// If `initial_sleep` is set, the first update is delayed by that amount.
     pub(crate) fn new(duration: Duration, initial_sleep: Option<Duration>) -> Self {
         let instance = Self {
-            trigger: Default::default(),
+            trigger: Arc::default(),
         };
 
         let trigger = Arc::downgrade(&instance.trigger);
         std::thread::spawn(move || {
             if let Some(duration) = initial_sleep {
-                std::thread::sleep(duration)
+                std::thread::sleep(duration);
             }
             while let Some(t) = trigger.upgrade() {
                 t.store(true, Ordering::Relaxed);
@@ -163,111 +146,238 @@ impl Throttle {
         instance
     }
 
-    /// Execute `f` only if the throttle currently allows an update.
-    pub(crate) fn throttled<F>(&self, f: F)
-    where
-        F: FnOnce(),
-    {
-        if self.can_update() {
-            f()
-        }
-    }
-
     /// Return `true` if we are not currently throttled.
     pub(crate) fn can_update(&self) -> bool {
         self.trigger.swap(false, Ordering::Relaxed)
     }
 }
 
+/// Gitignore-style patterns, read from files, which exclude entries from a traversal.
+///
+/// Patterns are matched against the path `dua` reports for an entry: normally relative to its
+/// effective working directory, or relative to an input root outside that directory. So `target/`
+/// excludes directories named `target` at any depth, while `/target/` excludes only `target` at
+/// the traversal root of that relative path, exactly like a `.gitignore` at the top of a repository.
+///
+/// Matching is case-sensitive on every platform so that the same pattern file produces the same
+/// report everywhere.
+#[derive(Clone, Debug)]
+pub struct IgnorePatterns {
+    search: gix::ignore::Search,
+}
+
+impl IgnorePatterns {
+    /// Read gitignore-style patterns from each file in `files`, in the given order.
+    ///
+    /// The usual `.gitignore` precedence applies: within a file the last matching line wins, and
+    /// files listed later win over files listed earlier. Reading a file that does not exist, or
+    /// that cannot be read, is an error - a silently empty pattern set would quietly report sizes
+    /// the caller did not ask for.
+    pub fn from_files(files: &[PathBuf]) -> anyhow::Result<Option<Self>> {
+        let mut search = gix::ignore::Search::default();
+        for file in files {
+            let buf = std::fs::read(file).with_context(|| {
+                format!("Failed to read ignore patterns from {}", file.display())
+            })?;
+            search.add_patterns_buffer(
+                &buf,
+                file.clone(),
+                None,
+                gix::ignore::search::Ignore::default(),
+            );
+        }
+        let pattern_count = search
+            .patterns
+            .iter()
+            .map(|list| list.patterns.len())
+            .sum::<usize>();
+        Ok(if pattern_count != 0 {
+            log::info!(
+                "Loaded {pattern_count} ignore pattern(s) from {file_count} file(s)",
+                file_count = files.len()
+            );
+            Some(Self { search })
+        } else {
+            None
+        })
+    }
+
+    /// Return `true` if `relative_path` is excluded, with `is_dir` telling directories from files
+    /// so that patterns ending in `/` only match directories.
+    ///
+    /// Note that callers are expected to stop descending into excluded directories, which also
+    /// means a negated pattern cannot bring back an entry below an excluded directory - the same
+    /// restriction Git has.
+    #[must_use]
+    pub fn is_excluded(&self, relative_path: &Path, is_dir: bool) -> bool {
+        if relative_path.as_os_str().is_empty() {
+            return false;
+        }
+        let relative_path =
+            gix::path::to_unix_separators_on_windows(gix::path::into_bstr(relative_path));
+        self.search
+            .pattern_matching_relative_path(
+                relative_path.as_ref(),
+                Some(is_dir),
+                gix::ignore::glob::pattern::Case::Sensitive,
+            )
+            .is_some_and(|match_| !match_.pattern.is_negative())
+    }
+
+    /// Return `true` if the input `path` is excluded, resolving it the way the traversal does.
+    /// These are made relative to `cwd`.
+    ///
+    /// Input paths that are excluded are best dropped before the walk starts, or they would be
+    /// reported as being empty rather than not reported at all.
+    #[must_use]
+    pub fn excludes_input_path(&self, path: &Path, cwd: &Path) -> bool {
+        pattern_relative_path(path, cwd, path)
+            .is_some_and(|relative_path| self.is_excluded(relative_path, path.is_dir()))
+    }
+}
+
 /// Configures a filesystem walk, including output and formatting options.
 #[derive(Clone)]
 pub struct WalkOptions {
-    /// The amount of threads to use. Refer to [`WalkDir::num_threads()`](https://docs.rs/jwalk/0.4.0/jwalk/struct.WalkDir.html#method.num_threads)
-    /// for more information.
+    /// The amount of filesystem worker threads to use.
     pub threads: usize,
     /// If `true`, count every hard-link occurrence independently.
     pub count_hard_links: bool,
     /// If `true`, use apparent size (`metadata.len()`), not allocated blocks on disk.
     pub apparent_size: bool,
-    /// Sorting mode applied by the filesystem walker.
-    pub sorting: TraversalSorting,
     /// If `false`, traversal is constrained to the root filesystem/device.
     pub cross_filesystems: bool,
     /// Canonicalized directories to skip from traversal.
     pub ignore_dirs: BTreeSet<PathBuf>,
+    /// Gitignore-style patterns whose matches are left out of the traversal entirely.
+    /// `None` if no pattern was configured.
+    pub ignore_patterns: Option<IgnorePatterns>,
+    /// Platform-specific metadata requested during traversal.
+    pub metadata_options: crate::TraversalOptions,
 }
 
-type WalkDir = jwalk::WalkDirGeneric<((), Option<Result<std::fs::Metadata, jwalk::Error>>)>;
+/// Tells whether an entry found under the root with the given index is left out of the traversal.
+type ExcludeEntry = Arc<dyn Fn(usize, &walk::Entry) -> bool + Send + Sync>;
+
+/// A root prepared for a filesystem walk.
+pub(crate) struct WalkRoot {
+    /// Index used to associate emitted events with the original input path.
+    pub index: usize,
+    /// Path at which to start walking.
+    pub path: PathBuf,
+    /// Entry already collected while enumerating this root, if available.
+    #[cfg(any(windows, target_os = "macos"))]
+    pub entry: Option<walk::Entry>,
+    /// Most specific original input root containing `path`, used as the ignore-pattern base.
+    /// Choosing the longest containing root preserves the right base when input roots overlap and
+    /// `path` is a subtree being refreshed.
+    ///
+    /// This is usually `path`, but can be a parent directory if this is the root for an
+    /// interactive refresh.
+    pub pattern_root: Option<PathBuf>,
+    /// Device containing the root, used to constrain cross-filesystem walks.
+    /// It's `0` if it couldn't be obtained or if `cross_filesystem` is `true`.
+    pub device_id: u64,
+}
 
 impl WalkOptions {
-    /// Create an iterator over `root` honoring this walk configuration.
-    ///
-    /// `root_device_id` is used to filter entries when `cross_filesystems == false`.
-    /// If `skip_root` is `true`, the root directory itself is omitted from yielded entries.
-    pub(crate) fn iter_from_path(
+    /// Return whether `path`, resolved relative to `cwd`, names an ignored directory.
+    #[must_use]
+    pub fn is_ignored_directory(&self, path: &Path, cwd: &Path) -> bool {
+        ignore_directory(path, &self.ignore_dirs, cwd)
+    }
+
+    pub(crate) fn iter_from_paths(
         &self,
-        root: &Path,
-        root_device_id: u64,
+        roots: Vec<WalkRoot>,
         skip_root: bool,
-    ) -> WalkDir {
+        order: walk::Order,
+    ) -> impl Iterator<Item = (usize, walk::RootEvent)> + use<> {
+        let num_roots = roots
+            .iter()
+            .map(|root| root.index)
+            .max()
+            .map_or(0, |idx| idx + 1);
+        let path_count = roots.len();
+        let (device_ids, root_paths, indexed_roots) = roots.into_iter().fold(
+            (
+                vec![0; num_roots],
+                vec![None; num_roots],
+                Vec::with_capacity(path_count),
+            ),
+            |(mut device_ids, mut root_paths, mut indexed_roots), root| {
+                device_ids[root.index] = root.device_id;
+                root_paths[root.index] = root.pattern_root;
+                #[cfg(any(windows, target_os = "macos"))]
+                indexed_roots.push((
+                    root.index,
+                    root.entry.map_or_else(
+                        || walk::Entry::from_path(&root.path, self.metadata_options),
+                        Ok,
+                    ),
+                ));
+                #[cfg(not(any(windows, target_os = "macos")))]
+                indexed_roots.push((root.index, root.path));
+                (device_ids, root_paths, indexed_roots)
+            },
+        );
         let ignore_dirs = self.ignore_dirs.clone();
-        let cwd = std::env::current_dir().unwrap_or_else(|_| root.to_owned());
-        WalkDir::new(root)
-            .follow_links(false)
-            .min_depth(if skip_root { 1 } else { 0 })
-            .sort(match self.sorting {
-                TraversalSorting::None => false,
-                TraversalSorting::AlphabeticalByFileName => true,
-            })
-            .skip_hidden(false)
-            .process_read_dir({
-                let cross_filesystems = self.cross_filesystems;
-                move |_, _, _, dir_entry_results| {
-                    dir_entry_results.iter_mut().for_each(|dir_entry_result| {
-                        if let Ok(dir_entry) = dir_entry_result {
-                            let metadata = dir_entry.metadata();
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let cross_filesystems = self.cross_filesystems;
 
-                            if dir_entry.file_type.is_dir() {
-                                let ok_for_fs = cross_filesystems
-                                    || metadata
-                                        .as_ref()
-                                        .map(|m| crossdev::is_same_device(root_device_id, m))
-                                        .unwrap_or(true);
-                                if !ok_for_fs
-                                    || ignore_directory(&dir_entry.path(), &ignore_dirs, &cwd)
-                                {
-                                    dir_entry.read_children_path = None;
-                                }
-                            }
+        // Excluding an entry means pruning it from the walk *and* from the emitted events, so the
+        // predicate is shared between the two. It short-circuits on the pattern set being empty to
+        // keep the common case free of the path building it would otherwise do per entry.
+        let is_excluded: ExcludeEntry = {
+            let patterns = self.ignore_patterns.clone();
+            let cwd = cwd.clone();
+            Arc::new(move |root_idx: usize, entry: &walk::Entry| {
+                let Some((patterns, pattern_root)) =
+                    patterns.as_ref().zip(root_paths[root_idx].as_deref())
+                else {
+                    return false;
+                };
+                let path = entry.path();
+                pattern_relative_path(&path, &cwd, pattern_root).is_some_and(|relative_path| {
+                    patterns.is_excluded(relative_path, entry.file_type.is_dir())
+                })
+            })
+        };
+        let is_excluded_while_walking = Arc::clone(&is_excluded);
+        let descend = move |root_idx: usize, entry: &walk::Entry| {
+            (cross_filesystems
+                || entry
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.as_ref().ok())
+                    .is_none_or(|metadata| {
+                        crossdev::is_same_device(device_ids[root_idx], metadata)
+                    }))
+                && (entry.depth == 0 || !ignore_directory(&entry.path(), &ignore_dirs, &cwd))
+                && !is_excluded_while_walking(root_idx, entry)
+        };
 
-                            dir_entry.client_state = Some(metadata);
-                        }
-                    })
-                }
-            })
-            .parallelism(match self.threads {
-                0 => jwalk::Parallelism::RayonDefaultPool {
-                    busy_timeout: std::time::Duration::from_secs(1),
-                },
-                1 => jwalk::Parallelism::Serial,
-                _ => jwalk::Parallelism::RayonExistingPool {
-                    pool: jwalk::rayon::ThreadPoolBuilder::new()
-                        .stack_size(128 * 1024)
-                        .num_threads(self.threads)
-                        .thread_name(|idx| format!("dua-fs-walk-{idx}"))
-                        .build()
-                        .expect("fields we set cannot fail")
-                        .into(),
-                    busy_timeout: None,
-                },
-            })
+        let walk = walk_roots(
+            indexed_roots,
+            self.threads,
+            order,
+            self.metadata_options,
+            descend,
+        );
+
+        walk.filter(move |(root_idx, event)| match event {
+            walk::RootEvent::Entry(Ok(entry)) => {
+                (!skip_root || entry.depth > 0) && !is_excluded(*root_idx, entry)
+            }
+            walk::RootEvent::Entry(Err(_)) | walk::RootEvent::Finished => true,
+        })
     }
 }
 
 /// Information we gather during a filesystem walk
 #[derive(Default)]
 pub struct WalkResult {
-    /// The amount of io::errors we encountered. Can happen when fetching meta-data, or when reading the directory contents.
+    /// The amount of `io::errors` we encountered. Can happen when fetching meta-data, or when reading the directory contents.
     pub num_errors: u64,
 }
 
@@ -275,6 +385,7 @@ impl WalkResult {
     /// Convert traversal result into a process exit code.
     ///
     /// Returns `0` if no I/O errors occurred, otherwise `1`.
+    #[must_use]
     pub fn to_exit_code(&self) -> i32 {
         i32::from(self.num_errors > 0)
     }
@@ -293,19 +404,37 @@ pub fn canonicalize_ignore_dirs(ignore_dirs: &[PathBuf]) -> BTreeSet<PathBuf> {
     dirs
 }
 
+/// Return the path that ignore patterns are matched against, or `None` if there is none.
+///
+/// `dua` reports entries by their path relative to the current directory `cwd` - it even changes into
+/// the directory it was given, if it was given exactly one - so that is what patterns should see.
+/// Roots outside via `traversal_root` of the current directory have no such path, and fall back to
+/// being relative to the root they were found under.
+fn pattern_relative_path<'a>(
+    path: &'a Path,
+    cwd: &Path,
+    traversal_root: &Path,
+) -> Option<&'a Path> {
+    if path.is_relative() {
+        return Some(path);
+    }
+    path.strip_prefix(cwd)
+        .or_else(|_| path.strip_prefix(traversal_root))
+        .ok()
+}
+
 fn ignore_directory(path: &Path, ignore_dirs: &BTreeSet<PathBuf>, cwd: &Path) -> bool {
     if ignore_dirs.is_empty() {
         return false;
     }
     let path = gix::path::realpath_opts(path, cwd, 32);
-    path.map(|path| {
+    path.is_ok_and(|path| {
         let ignored = ignore_dirs.contains(&path);
         if ignored {
-            log::debug!("Ignored {path:?}");
+            log::debug!("Ignored {}", path.display());
         }
         ignored
     })
-    .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -313,8 +442,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ignore_directories() {
+    fn every_byte_format_handles_the_maximum_snapshot_size() {
+        for format in [
+            ByteFormat::Metric,
+            ByteFormat::Binary,
+            ByteFormat::Bytes,
+            ByteFormat::GB,
+            ByteFormat::GiB,
+            ByteFormat::MB,
+            ByteFormat::MiB,
+        ] {
+            assert_eq!(
+                format.display(u128::MAX).to_string(),
+                format!("{} b", u128::MAX)
+            );
+        }
+    }
+
+    #[test]
+    fn walk_options_identify_ignored_directories() {
         let cwd = std::env::current_dir().unwrap();
+        let mut options = WalkOptions {
+            threads: 1,
+            count_hard_links: false,
+            apparent_size: false,
+            cross_filesystems: true,
+            ignore_dirs: BTreeSet::new(),
+            ignore_patterns: None,
+            metadata_options: crate::TraversalOptions::default(),
+        };
         #[cfg(unix)]
         let mut parameters = vec![
             ("/usr", vec!["/usr"], true),
@@ -344,20 +500,298 @@ mod tests {
         ];
 
         parameters.extend([
+            ("src", vec![], false),
             ("src", vec!["src"], true),
             ("src/interactive", vec!["src"], false),
             ("src/interactive/..", vec!["src"], true),
         ]);
 
         for (path, ignore_dirs, expected_result) in parameters {
-            let ignore_dirs = canonicalize_ignore_dirs(
+            options.ignore_dirs = canonicalize_ignore_dirs(
                 &ignore_dirs.into_iter().map(Into::into).collect::<Vec<_>>(),
             );
             assert_eq!(
-                ignore_directory(path.as_ref(), &ignore_dirs, &cwd),
+                options.is_ignored_directory(path.as_ref(), &cwd),
                 expected_result,
-                "result='{expected_result}' for path='{path}' and ignore_dir='{ignore_dirs:?}' "
+                "result='{expected_result}' for path='{path}' and ignore_dir='{:?}' ",
+                options.ignore_dirs
             );
         }
+    }
+
+    #[test]
+    fn explicitly_selected_ignored_root_is_traversed() {
+        let root = tempfile::tempdir().unwrap();
+        let child = root.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        let options = WalkOptions {
+            threads: 2,
+            count_hard_links: false,
+            apparent_size: false,
+            cross_filesystems: true,
+            ignore_dirs: canonicalize_ignore_dirs(&[root.path().to_owned()]),
+            ignore_patterns: None,
+            metadata_options: crate::TraversalOptions::default(),
+        };
+
+        let paths = options
+            .iter_from_paths(
+                vec![WalkRoot {
+                    index: 0,
+                    pattern_root: None,
+                    path: root.path().to_owned(),
+                    #[cfg(any(windows, target_os = "macos"))]
+                    entry: None,
+                    device_id: crossdev::init(root.path()).unwrap(),
+                }],
+                false,
+                walk::Order::Completion,
+            )
+            .filter_map(|(_, event)| match event {
+                walk::RootEvent::Entry(entry) => Some(entry.unwrap().path()),
+                walk::RootEvent::Finished => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(paths.contains(&child));
+    }
+
+    #[test]
+    fn ignore_patterns_use_gitignore_semantics() {
+        let patterns = patterns_from(
+            "# a comment, and the blank line below, match nothing\n\
+             \n\
+             *.log\n\
+             !keep.log\n\
+             build/\n\
+             /anchored\n\
+             **/node_modules/\n",
+        );
+
+        for (path, is_dir, expected) in [
+            ("debug.log", false, true),
+            ("nested/debug.log", false, true),
+            ("keep.log", false, false),
+            ("build", true, true),
+            // A trailing '/' in a pattern only ever matches directories.
+            ("build", false, false),
+            ("anchored", true, true),
+            ("nested/anchored", true, false),
+            ("nested/deeply/node_modules", true, true),
+            ("src", true, false),
+            ("", true, false),
+        ] {
+            assert_eq!(
+                patterns.is_excluded(Path::new(path), is_dir),
+                expected,
+                "expected is_excluded({path:?}, is_dir={is_dir}) to be {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn later_ignore_files_win_over_earlier_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+        std::fs::write(&first, "*.tmp\n").unwrap();
+        std::fs::write(&second, "!important.tmp\n").unwrap();
+
+        let patterns = IgnorePatterns::from_files(&[first, second])
+            .unwrap()
+            .unwrap();
+
+        assert!(patterns.is_excluded(Path::new("scratch.tmp"), false));
+        assert!(
+            !patterns.is_excluded(Path::new("important.tmp"), false),
+            "the negation in the second file overrides the first file"
+        );
+    }
+
+    #[test]
+    fn unreadable_ignore_files_are_an_error() {
+        let err = IgnorePatterns::from_files(&[PathBuf::from("does-not-exist")])
+            .expect_err("a missing pattern file must not be silently skipped");
+        assert!(err.to_string().contains("does-not-exist"));
+    }
+
+    #[test]
+    fn empty_ignore_files_produce_none() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "# comment only\n").unwrap();
+        assert!(
+            IgnorePatterns::from_files(&[file.path().to_owned()])
+                .unwrap()
+                .is_none(),
+            "no patterns means no need to match anything"
+        );
+    }
+
+    #[test]
+    fn matching_entries_are_pruned_from_the_walk() {
+        let root = tempfile::tempdir().unwrap();
+        for dir in ["keep", "build", "keep/node_modules"] {
+            std::fs::create_dir(root.path().join(dir)).unwrap();
+        }
+        for file in [
+            "keep/main.rs",
+            "keep/debug.log",
+            "build/artifact",
+            "keep/node_modules/dep",
+        ] {
+            std::fs::write(root.path().join(file), b"x").unwrap();
+        }
+
+        assert_eq!(
+            walk_with_patterns(root.path(), "*.log\n**/node_modules/\n"),
+            [
+                PathBuf::new(),
+                PathBuf::from("build"),
+                PathBuf::from("build/artifact"),
+                PathBuf::from("keep"),
+                PathBuf::from("keep/main.rs"),
+            ],
+            "excluded directories are pruned along with everything below them, \
+             and excluded files never show up"
+        );
+    }
+
+    #[test]
+    fn patterns_match_the_path_dua_reports() {
+        let here = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let (cwd, outside) = (here.path(), elsewhere.path());
+
+        for dir in ["target", "nested", "nested/target"] {
+            std::fs::create_dir_all(here.path().join(dir)).unwrap();
+        }
+        assert_eq!(
+            walk_with_patterns(here.path(), "/target/\n"),
+            [
+                PathBuf::new(),
+                PathBuf::from("nested"),
+                PathBuf::from("nested/target"),
+            ],
+            "an anchored pattern excludes only the top-level target"
+        );
+
+        // Several inputs below the current directory also keep their reported path.
+        let (entry, root) = (cwd.join("a").join("b"), cwd.join("a"));
+        let reported = Path::new("a").join("b");
+        assert_eq!(
+            pattern_relative_path(&entry, cwd, &root),
+            Some(reported.as_path())
+        );
+
+        // Inputs elsewhere have no path relative to the current directory, so they fall back to
+        // being relative to the input they were found under.
+        let entry = outside.join("syslog");
+        assert_eq!(
+            pattern_relative_path(&entry, cwd, outside),
+            Some(Path::new("syslog"))
+        );
+
+        // Such an input is empty relative to itself, and so never matches a pattern.
+        assert_eq!(
+            pattern_relative_path(outside, cwd, outside),
+            Some(Path::new(""))
+        );
+        assert!(!patterns_from("*\n").is_excluded(Path::new(""), true));
+    }
+
+    #[test]
+    fn subtree_walk_keeps_the_original_pattern_root() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("secret"), []).unwrap();
+        std::fs::write(nested.join("visible"), []).unwrap();
+        let options = WalkOptions {
+            threads: 1,
+            count_hard_links: false,
+            apparent_size: false,
+            cross_filesystems: true,
+            ignore_dirs: BTreeSet::default(),
+            ignore_patterns: Some(patterns_from("nested/secret\n")),
+            metadata_options: crate::TraversalOptions::default(),
+        };
+
+        let paths = options
+            .iter_from_paths(
+                vec![WalkRoot {
+                    index: 0,
+                    path: nested,
+                    #[cfg(any(windows, target_os = "macos"))]
+                    entry: None,
+                    pattern_root: Some(root.path().to_owned()),
+                    device_id: 0,
+                }],
+                false,
+                walk::Order::Completion,
+            )
+            .filter_map(|(_, event)| match event {
+                walk::RootEvent::Entry(entry) => Some(entry.unwrap().file_name),
+                walk::RootEvent::Finished => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(!paths.iter().any(|path| path == "secret"));
+        assert!(paths.iter().any(|path| path == "visible"));
+    }
+
+    #[test]
+    fn excluded_input_paths_are_dropped_before_the_walk() {
+        // Relies on the crate directory being current, like `test_ignore_directories` above.
+        let patterns = patterns_from("src/\n*.toml\n");
+        let cwd = std::env::current_dir().unwrap();
+
+        assert!(
+            patterns.excludes_input_path(Path::new("src"), &cwd),
+            "a directory pattern matches a directory given as input"
+        );
+        assert!(patterns.excludes_input_path(Path::new("Cargo.toml"), &cwd));
+        assert!(!patterns.excludes_input_path(Path::new("README.md"), &cwd));
+    }
+
+    fn patterns_from(contents: &str) -> IgnorePatterns {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), contents).unwrap();
+        IgnorePatterns::from_files(&[file.path().to_owned()])
+            .unwrap()
+            .unwrap()
+    }
+
+    fn walk_with_patterns(root: &Path, contents: &str) -> Vec<PathBuf> {
+        let options = WalkOptions {
+            threads: 2,
+            count_hard_links: false,
+            apparent_size: false,
+            cross_filesystems: true,
+            ignore_dirs: BTreeSet::default(),
+            ignore_patterns: Some(patterns_from(contents)),
+            metadata_options: crate::TraversalOptions::default(),
+        };
+
+        let mut paths = options
+            .iter_from_paths(
+                vec![WalkRoot {
+                    index: 0,
+                    pattern_root: Some(root.to_owned()),
+                    path: root.to_owned(),
+                    #[cfg(any(windows, target_os = "macos"))]
+                    entry: None,
+                    device_id: crossdev::init(root).unwrap(),
+                }],
+                false,
+                walk::Order::Completion,
+            )
+            .filter_map(|(_, event)| match event {
+                walk::RootEvent::Entry(entry) => {
+                    Some(entry.unwrap().path().strip_prefix(root).unwrap().to_owned())
+                }
+                walk::RootEvent::Finished => None,
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
     }
 }

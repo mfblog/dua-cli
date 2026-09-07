@@ -1,27 +1,48 @@
 use crate::interactive::app::tests::utils::{
-    debug, initialized_app_and_terminal_from_fixture, sample_01_tree, sample_02_tree,
+    initialized_app_and_terminal_from_fixture, sample_01_tree, sample_02_tree,
 };
 use crate::interactive::app::{state::AppState, tree_view::TreeView};
-use crate::interactive::widgets::glob_search;
+use crate::interactive::widgets::{Language, glob_search};
 use crate::interactive::{EntryCheck, MTimeSort, SortMode, sorted_entries};
 use anyhow::Result;
+use dua::WalkOptions;
 use dua::traverse::{EntryData, Traversal, Tree, TreeIndex};
-use dua::{TraversalSorting, WalkOptions};
 use gix::glob::pattern::Case;
 use pretty_assertions::assert_eq;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Instant;
 use std::time::{Duration, UNIX_EPOCH};
+
+/// Compare path/metadata topology while ignoring discovery order and mtimes.
+fn trees_match(left: &Tree, right: &Tree) -> bool {
+    fn topology(tree: &Tree) -> Vec<(PathBuf, Option<u64>, bool, Option<u128>)> {
+        let mut entries = tree
+            .indices()
+            .map(|index| {
+                let data = tree.data(index).unwrap();
+                (
+                    crate::interactive::path_of(tree, index, None),
+                    data.entry_count,
+                    data.metadata_io_error,
+                    data.entry_count.is_none().then_some(data.size),
+                )
+            })
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
+    }
+    topology(left) == topology(right)
+}
 
 #[test]
 fn it_can_handle_ending_traversal_reaching_top_but_skipping_levels() -> Result<()> {
     let (_, app) = initialized_app_and_terminal_from_fixture(&["sample-01"])?;
     let expected_tree = sample_01_tree();
 
-    assert_eq!(
-        debug(app.traversal.tree),
-        debug(expected_tree),
-        "filesystem graph is stable and matches the directory structure"
+    assert!(
+        trees_match(&app.traversal.tree, &expected_tree),
+        "filesystem tree matches the directory structure regardless of discovery order"
     );
     Ok(())
 }
@@ -31,10 +52,9 @@ fn it_can_handle_ending_traversal_without_reaching_the_top() -> Result<()> {
     let (_, app) = initialized_app_and_terminal_from_fixture(&["sample-02"])?;
     let (expected_tree, _) = sample_02_tree(true);
 
-    assert_eq!(
-        debug(app.traversal.tree),
-        debug(expected_tree),
-        "filesystem graph is stable and matches the directory structure"
+    assert!(
+        trees_match(&app.traversal.tree, &expected_tree),
+        "filesystem tree matches the directory structure regardless of discovery order"
     );
     Ok(())
 }
@@ -42,23 +62,37 @@ fn it_can_handle_ending_traversal_without_reaching_the_top() -> Result<()> {
 #[test]
 fn it_can_do_a_glob_search() {
     let (tree, root_index) = sample_02_tree(false);
-    let result = glob_search(&tree, root_index, "tests/fixtures/sample-02", Case::Fold).unwrap();
-    let expected = vec![TreeIndex::from(1)];
+    let result = glob_search(
+        &tree,
+        root_index,
+        "tests/fixtures/sample-02",
+        Case::Fold,
+        Language::English,
+    )
+    .unwrap();
+    let expected = vec![TreeIndex::new(1)];
     assert_eq!(result, expected);
 }
 
 #[test]
 fn it_can_do_a_case_sensitive_glob_search() {
     let (tree, root_index) = sample_02_tree(false);
-    let result_insensitive =
-        glob_search(&tree, root_index, "TESTS/FIXTURES/SAMPLE-02", Case::Fold).unwrap();
-    assert_eq!(result_insensitive, vec![TreeIndex::from(1)]);
+    let result_insensitive = glob_search(
+        &tree,
+        root_index,
+        "TESTS/FIXTURES/SAMPLE-02",
+        Case::Fold,
+        Language::English,
+    )
+    .unwrap();
+    assert_eq!(result_insensitive, vec![TreeIndex::new(1)]);
 
     let result_sensitive = glob_search(
         &tree,
         root_index,
         "TESTS/FIXTURES/SAMPLE-02",
         Case::Sensitive,
+        Language::English,
     )
     .unwrap();
     assert!(result_sensitive.is_empty());
@@ -77,16 +111,16 @@ fn it_can_sort_directory_mtimes_by_recursive_entries() {
         mtime_seconds: u64,
         is_dir: bool,
     ) -> TreeIndex {
-        let idx = tree.add_node(EntryData {
-            name: PathBuf::from(name),
+        let data = EntryData {
             mtime: mtime(mtime_seconds),
             is_dir,
             ..Default::default()
-        });
+        };
         if let Some(parent) = parent {
-            tree.add_edge(parent, idx, ());
+            tree.add_child(parent, name, data)
+        } else {
+            tree.add_root(name, data)
         }
-        idx
     }
 
     let mut tree = Tree::new();
@@ -103,6 +137,7 @@ fn it_can_sort_directory_mtimes_by_recursive_entries() {
         &tree,
         root,
         SortMode::MTimeDescending(MTimeSort::RecursiveChildrenNewest),
+        None,
         None,
         EntryCheck::Disabled,
     );
@@ -131,6 +166,7 @@ fn it_can_sort_directory_mtimes_by_recursive_entries() {
         &tree,
         root,
         SortMode::MTimeDescending(MTimeSort::RecursiveChildrenOldest),
+        None,
         None,
         EntryCheck::Disabled,
     );
@@ -166,11 +202,14 @@ fn it_can_sort_directory_mtimes_by_recursive_entries() {
             threads: 1,
             apparent_size: true,
             count_hard_links: false,
-            sorting: TraversalSorting::AlphabeticalByFileName,
             cross_filesystems: false,
-            ignore_dirs: Default::default(),
+            ignore_dirs: BTreeSet::default(),
+            ignore_patterns: None,
+            metadata_options: dua::TraversalOptions::default(),
         },
         Vec::new(),
+        None,
+        false,
     );
     state.navigation.view_root = root;
     state.sorting = SortMode::MTimeDescending(MTimeSort::Entry);
@@ -179,12 +218,14 @@ fn it_can_sort_directory_mtimes_by_recursive_entries() {
         root,
         state.sorting,
         None,
+        None,
         EntryCheck::Disabled,
     );
 
     let tree_view = TreeView {
         traversal: &mut traversal,
         glob_tree_root: None,
+        glob_matches: None,
     };
     state.cycle_mtime_sort_mode(&tree_view);
     assert_eq!(
